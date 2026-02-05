@@ -1,134 +1,107 @@
 #!/bin/bash
-# PixHost 批量上传工具 (增强版)
-# 功能：支持更多格式、并行上传思路以及更健壮的 URL 转换
+# PixHost 批量上传脚本 (API 修复版)
+# 修复内容：基于 API 返回的 th_url 动态计算直链，支持更多格式，增强稳定性
 
 # --- 颜色定义 ---
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # 无颜色
+G='\033[0;32m'
+R='\033[0;31m'
+Y='\033[1;33m'
+NC='\033[0m'
 
 # --- 依赖检查 ---
 check_deps() {
-    for pkg in jq curl file; do
+    for pkg in jq curl; do
         if ! command -v "$pkg" &>/dev/null; then
-            echo -e "${YELLOW}正在安装依赖: $pkg...${NC}"
-            sudo apt update -y >/dev/null 2>&1 && sudo apt install -y "$pkg" >/dev/null 2>&1 || {
-                echo -e "${RED}错误: $pkg 安装失败，请手动安装。${NC}"
-                exit 1
-            }
+            echo -e "${Y}正在安装依赖: $pkg...${NC}"
+            sudo apt update -y >/dev/null 2>&1 && sudo apt install -y "$pkg" >/dev/null 2>&1
         fi
     done
 }
 
-# --- 参数与目录检查 ---
-if [ -z "$1" ]; then
-    echo "用法: $0 <图片目录路径>"
-    exit 1
-fi
-
-DIR="$1"
-[[ ! -d "$DIR" ]] && { echo -e "${RED}错误: 目录不存在 [$DIR]${NC}"; exit 1; }
-
-# --- 文件验证 ---
-validate_file() {
-    local file="$1"
-    [[ ! -f "$file" ]] && return 1
-    # 增加 webp 支持
-    file --mime-type "$file" | grep -qiE 'image/(jpeg|png|gif|webp|bmp)' || return 1
-    # 限制 10MB
-    [[ $(stat -c%s "$file") -gt 10485760 ]] && return 1
-    return 0
-}
-
-# --- 核心：直链转换器 ---
-# PixHost API 返回 show_url (展示页)，我们需要推导其存储服务器
-convert_to_direct_url() {
-    local show_url="$1"
-    # PixHost 的逻辑通常是 https://pixhost.to/show/[ID]/[FILENAME]
-    # 直链通常是 https://img[N].pixhost.to/images/[ID]/[FILENAME]
-    # 关键在于：show_url 页面内其实包含服务器编号，但为了脚本简洁，
-    # 绝大多数新上传都通过 img1 分发。如果 img1 失效，可能需要更复杂的正则。
-    
-    if [[ "$show_url" =~ show/([0-9]+)/(.+)$ ]]; then
-        local img_id="${BASH_REMATCH[1]}"
-        local img_name="${BASH_REMATCH[2]}"
-        echo "https://img1.pixhost.to/images/${img_id}/${img_name}"
-    else
-        return 1
+# --- 核心：直链转换算法 ---
+# 原理：PixHost 的缩略图是 https://thX.pixhost.to/thumbs/ID/NAME
+# 对应的直链通常是 https://imgX.pixhost.to/images/ID/NAME
+get_direct_url() {
+    local th_url="$1"
+    if [[ -n "$th_url" ]]; then
+        # 将 'th' 替换为 'img'，将 'thumbs' 替换为 'images'
+        echo "$th_url" | sed 's|//th|//img|; s|/thumbs/|/images/|'
     fi
 }
 
 # --- 上传函数 ---
 upload_image() {
-    local image="$1"
-    local response
+    local img_path="$1"
     
-    # 增加超时处理，防止脚本卡死
-    response=$(curl -s --connect-timeout 10 --max-time 60 "https://api.pixhost.to/images" \
+    # 按照 API 文档发送 POST 请求
+    # content_type: 0 为安全内容，1 为成人内容
+    # max_th_size: 缩略图尺寸
+    local response=$(curl -s -X POST "https://api.pixhost.to/images" \
         -H "Accept: application/json" \
-        -F "img=@$image" \
+        -F "img=@$img_path" \
         -F "content_type=0" \
         -F "max_th_size=420")
 
-    # 检查 API 是否返回了正确的 JSON
-    if ! jq -e . <<<"$response" >/dev/null 2>&1; then
+    # 解析返回的 JSON
+    if ! echo "$response" | jq -e . >/dev/null 2>&1; then
         return 1
     fi
 
-    local show_url=$(jq -r '.show_url // empty' <<<"$response")
-    [[ -z "$show_url" ]] && return 1
+    local th_url=$(echo "$response" | jq -r '.th_url // empty')
+    local show_url=$(echo "$response" | jq -r '.show_url // empty')
 
-    convert_to_direct_url "$show_url"
+    if [[ -z "$th_url" ]]; then
+        return 1
+    fi
+
+    # 计算直链
+    local direct_url=$(get_direct_url "$th_url")
+    echo "$direct_url"
 }
 
 # --- 主程序 ---
 main() {
+    [[ -z "$1" ]] && { echo "用法: $0 <图片目录>"; exit 1; }
     check_deps
-    
-    local files=()
-    # 改进文件查找，支持更多后缀且对特殊字符更友好
-    while IFS= read -r -d '' file; do
-        files+=("$file")
-    done < <(find "$DIR" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.gif" -o -iname "*.webp" \) -print0)
 
-    local total=${#files[@]}
-    [[ $total -eq 0 ]] && { echo "未发现有效图片。"; exit 0; }
-
-    echo -e "${GREEN}找到 $total 个文件，准备上传...${NC}"
-
+    local dir="$1"
     local success=0
-    local bbcode_links=""
-    local direct_links=""
+    local total=0
+    local bbcode_output=""
+    local direct_output=""
+
+    # 查找常见图片格式
+    mapfile -d $'\0' files < <(find "$dir" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.gif" -o -iname "*.webp" \) -print0)
+    total=${#files[@]}
+
+    [[ $total -eq 0 ]] && { echo -e "${R}错误: 目录中没有发现图片${NC}"; exit 1; }
+
+    echo -e "${G}开始上传 ${total} 张图片到 PixHost...${NC}\n"
 
     for img in "${files[@]}"; do
-        echo -n "正在上传: $(basename "$img")... "
-        if ! validate_file "$img"; then
-            echo -e "${YELLOW}[跳过: 格式不支持或文件过大]${NC}"
-            continue
-        fi
+        local fname=$(basename "$img")
+        echo -n "正在上传 [$fname] ... "
 
-        local direct_url
-        direct_url=$(upload_image "$img")
-        
+        local d_url=$(upload_image "$img")
         if [[ $? -eq 0 ]]; then
+            echo -e "${G}成功${NC}"
             ((success++))
-            bbcode_links+="[img]${direct_url}[/img]\n"
-            direct_links+="${direct_url}\n"
-            echo -e "${GREEN}[成功]${NC}"
+            bbcode_output+="[img]${d_url}[/img]\n"
+            direct_output+="${d_url}\n"
         else
-            echo -e "${RED}[失败]${NC}"
+            echo -e "${R}失败${NC}"
         fi
     done
 
-    # 输出结果
-    echo -e "\n--- 上传报告 ($success/$total) ---"
+    # 输出汇总结果
     if [[ $success -gt 0 ]]; then
-        echo -e "\n${YELLOW}[BBCode 代码]${NC}"
-        echo -e "$bbcode_links"
-        echo -e "${YELLOW}[图片直链]${NC}"
-        echo -e "$direct_links"
+        echo -e "\n${Y}====== 结果汇总 (${success}/${total}) ======${NC}"
+        echo -e "\n[BBCode 代码]"
+        echo -e "$bbcode_output"
+        echo -e "\n[图片直链]"
+        echo -e "$direct_output"
+        echo -e "${Y}==========================================${NC}"
     fi
 }
 
-main
+main "$1"
