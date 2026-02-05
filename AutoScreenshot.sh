@@ -94,7 +94,7 @@ fi
 # 5) 若截图成功则上传（核心流程不变）
 if [ $RET -eq 0 ]; then
   echo "[信息] 截图完成，开始上传截图..."
-  bash <(curl -s https://raw.githubusercontent.com/guyuanwind/Seedbox/refs/heads/main/PixhostUpload.sh) "$SCREENSHOT_DIR"
+  bash <(curl -s https://raw.githubusercontent.com/zqh20020729/Seedbox/refs/heads/main/PixhostUpload.sh) "$SCREENSHOT_DIR"
 else
   echo "[错误] 截图失败，无法继续上传。"
   exit 1
